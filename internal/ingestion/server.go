@@ -10,33 +10,58 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/vpp/dispatch-engine/internal/lifecycle"
 	"github.com/vpp/dispatch-engine/internal/mms"
 	"github.com/vpp/dispatch-engine/internal/redispool"
 )
 
 type Server struct {
-	addr         string
-	listener     net.Listener
-	redisPool    *redispool.Pool
-	connCount    atomic.Int64
-	msgCount     atomic.Int64
-	errorCount   atomic.Int64
-	mu           sync.Mutex
-	connections  map[net.Conn]struct{}
-	cancel       context.CancelFunc
+	addr          string
+	listener      net.Listener
+	redisPool     *redispool.Pool
+	connCount     atomic.Int64
+	msgCount      atomic.Int64
+	errorCount    atomic.Int64
+	rejectCount   atomic.Int64
+	mu            sync.Mutex
+	connections   map[net.Conn]context.CancelFunc
+	cancel        context.CancelFunc
 	onMeasurement func(data *mms.SubstationData)
+	gm            *lifecycle.GoroutineManager
+	connLimiter   *lifecycle.ConnLimiter
+	idleTimeout   time.Duration
 }
 
 type Config struct {
 	ListenAddr string
 	RedisPool  *redispool.Pool
+	GM         *lifecycle.GoroutineManager
+	MaxConns   int
+	IdleTimeout time.Duration
 }
 
 func NewServer(cfg Config) *Server {
+	maxConns := cfg.MaxConns
+	if maxConns == 0 {
+		maxConns = 500
+	}
+	idleTimeout := cfg.IdleTimeout
+	if idleTimeout == 0 {
+		idleTimeout = 60 * time.Second
+	}
+
+	gm := cfg.GM
+	if gm == nil {
+		gm = lifecycle.NewGoroutineManager(context.Background())
+	}
+
 	return &Server{
 		addr:        cfg.ListenAddr,
 		redisPool:   cfg.RedisPool,
-		connections: make(map[net.Conn]struct{}),
+		connections: make(map[net.Conn]context.CancelFunc),
+		gm:          gm,
+		connLimiter: lifecycle.NewConnLimiter(maxConns),
+		idleTimeout: idleTimeout,
 	}
 }
 
@@ -55,14 +80,13 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.listener = ln
 
-	log.Printf("[ingestion] TCP listener started on %s", s.addr)
+	log.Printf("[ingestion] TCP listener started on %s (maxConns=%d, idleTimeout=%v)",
+		s.addr, s.connLimiter.Max(), s.idleTimeout)
 
-	go s.acceptLoop(childCtx)
-
-	go func() {
-		<-childCtx.Done()
-		s.shutdown()
-	}()
+	s.gm.Go(func(gmCtx context.Context) error {
+		s.acceptLoop(gmCtx)
+		return nil
+	}, lifecycle.WithName("ingestion-accept"))
 
 	return nil
 }
@@ -75,8 +99,28 @@ func (s *Server) acceptLoop(ctx context.Context) {
 		default:
 		}
 
+		if !s.connLimiter.Acquire() {
+			s.rejectCount.Add(1)
+			log.Printf("[ingestion] connection limit reached (%d), rejecting", s.connLimiter.Active())
+
+			tempConn, err := s.listener.Accept()
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					continue
+				}
+			}
+			tempConn.SetDeadline(time.Now().Add(5 * time.Second))
+			tempConn.Write([]byte("ERROR: connection limit reached\r\n"))
+			tempConn.Close()
+			continue
+		}
+
 		conn, err := s.listener.Accept()
 		if err != nil {
+			s.connLimiter.Release()
 			select {
 			case <-ctx.Done():
 				return
@@ -86,20 +130,29 @@ func (s *Server) acceptLoop(ctx context.Context) {
 			}
 		}
 
+		connCtx, connCancel := context.WithCancel(ctx)
+
 		s.mu.Lock()
-		s.connections[conn] = struct{}{}
+		s.connections[conn] = connCancel
 		s.mu.Unlock()
 		s.connCount.Add(1)
 
-		log.Printf("[ingestion] new connection from %s (active: %d)", conn.RemoteAddr(), s.connCount.Load())
+		log.Printf("[ingestion] new connection from %s (active: %d, limit: %d)",
+			conn.RemoteAddr(), s.connLimiter.Active(), s.connLimiter.Max())
 
-		go s.handleConnection(ctx, conn)
+		s.gm.Go(func(gmCtx context.Context) error {
+			s.handleConnection(connCtx, conn, connCancel)
+			return nil
+		}, lifecycle.WithName("ingestion-conn:"+conn.RemoteAddr().String()))
 	}
 }
 
-func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
+func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connCancel context.CancelFunc) {
 	defer func() {
+		connCancel()
 		conn.Close()
+		s.connLimiter.Release()
+
 		s.mu.Lock()
 		delete(s.connections, conn)
 		s.mu.Unlock()
@@ -108,31 +161,44 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 	buf := make([]byte, 0, 65536)
 	tmp := make([]byte, 8192)
+	lastData := time.Now()
 
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("[ingestion] connection %s context cancelled, closing", conn.RemoteAddr())
 			return
 		default:
 		}
 
-		if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		deadline := time.Now().Add(30 * time.Second)
+		if err := conn.SetReadDeadline(deadline); err != nil {
 			return
 		}
 
 		n, err := conn.Read(tmp)
 		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			if err == io.EOF {
-				log.Printf("[ingestion] connection %s closed by peer", conn.RemoteAddr())
 				return
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				if time.Since(lastData) > s.idleTimeout {
+					log.Printf("[ingestion] connection %s idle timeout (%v)", conn.RemoteAddr(), s.idleTimeout)
+					return
+				}
 				continue
 			}
 			log.Printf("[ingestion] read error from %s: %v", conn.RemoteAddr(), err)
 			return
 		}
 
+		lastData = time.Now()
 		buf = append(buf, tmp[:n]...)
 
 		for len(buf) >= 4 {
@@ -152,8 +218,13 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			copy(frame, buf[:frameLen])
 			buf = buf[frameLen:]
 
-			s.processFrame(payload)
-			s.msgCount.Add(1)
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				s.processFrame(payload)
+				s.msgCount.Add(1)
+			}
 		}
 
 		if len(buf) > 32768 {
@@ -200,13 +271,35 @@ func (s *Server) shutdown() {
 	}
 
 	s.mu.Lock()
-	for conn := range s.connections {
-		conn.Close()
+	for conn, cancel := range s.connections {
+		cancel()
+		conn.SetDeadline(time.Now())
 	}
-	s.connections = make(map[net.Conn]struct{})
 	s.mu.Unlock()
 
-	log.Printf("[ingestion] server shutdown complete (msg=%d, err=%d)", s.msgCount.Load(), s.errorCount.Load())
+	timeout := time.After(5 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			s.mu.Lock()
+			for conn := range s.connections {
+				conn.Close()
+			}
+			s.connections = make(map[net.Conn]context.CancelFunc)
+			s.mu.Unlock()
+			log.Printf("[ingestion] forced shutdown, remaining connections killed")
+			return
+		case <-ticker.C:
+			if s.connCount.Load() == 0 {
+				log.Printf("[ingestion] graceful shutdown complete (msg=%d, err=%d, reject=%d)",
+					s.msgCount.Load(), s.errorCount.Load(), s.rejectCount.Load())
+				return
+			}
+		}
+	}
 }
 
 func (s *Server) Stats() (connections int64, messages int64, errors int64) {
@@ -217,4 +310,5 @@ func (s *Server) Stop() {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	s.shutdown()
 }

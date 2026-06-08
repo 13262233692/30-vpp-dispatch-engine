@@ -3,12 +3,14 @@ package dispatcher
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"sync"
 	"time"
 
 	proto "github.com/vpp/dispatch-engine/api/proto"
+	"github.com/vpp/dispatch-engine/internal/lifecycle"
 	"github.com/vpp/dispatch-engine/internal/redispool"
 )
 
@@ -25,29 +27,56 @@ type FlexibleLoad struct {
 }
 
 type DispatchResult struct {
-	Commands          []*proto.DeviceControlCommand
-	TotalReductionMW  float64
-	DeviceCount       int
-	ComputeTimeUS     int64
-	Feasible          bool
-	RemainingGapMW    float64
+	Commands         []*proto.DeviceControlCommand
+	TotalReductionMW float64
+	DeviceCount      int
+	ComputeTimeUS    int64
+	Feasible         bool
+	RemainingGapMW   float64
 }
 
 type Engine struct {
-	redisPool *redispool.Pool
-	mu        sync.RWMutex
-	loads     map[string]*FlexibleLoad
+	redisPool    *redispool.Pool
+	mu           sync.RWMutex
+	loads        map[string]*FlexibleLoad
+	gm           *lifecycle.GoroutineManager
+	syncInterval time.Duration
 }
 
-func NewEngine(pool *redispool.Pool) *Engine {
+func NewEngine(pool *redispool.Pool, opts ...EngineOption) *Engine {
 	eng := &Engine{
-		redisPool: pool,
-		loads:     make(map[string]*FlexibleLoad),
+		redisPool:    pool,
+		loads:        make(map[string]*FlexibleLoad),
+		gm:           lifecycle.NewGoroutineManager(context.Background()),
+		syncInterval: 5 * time.Second,
 	}
 
-	go eng.syncLoop()
+	for _, opt := range opts {
+		opt(eng)
+	}
 
 	return eng
+}
+
+type EngineOption func(*Engine)
+
+func WithGoroutineManager(gm *lifecycle.GoroutineManager) EngineOption {
+	return func(e *Engine) { e.gm = gm }
+}
+
+func WithSyncInterval(d time.Duration) EngineOption {
+	return func(e *Engine) { e.syncInterval = d }
+}
+
+func (e *Engine) Start(ctx context.Context) {
+	e.gm.Go(func(gmCtx context.Context) error {
+		e.syncLoop(gmCtx)
+		return nil
+	}, lifecycle.WithName("dispatcher-sync"), lifecycle.WithParent(ctx))
+}
+
+func (e *Engine) Stop() {
+	e.gm.CancelAll()
 }
 
 func (e *Engine) RegisterLoad(load *FlexibleLoad) {
@@ -345,45 +374,61 @@ func (e *Engine) FleetStatus(req *proto.FleetStatusRequest) *proto.FleetStatusRe
 	}
 }
 
-func (e *Engine) syncLoop() {
-	ticker := time.NewTicker(5 * time.Second)
+func (e *Engine) syncLoop(ctx context.Context) {
+	ticker := time.NewTicker(e.syncInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		if e.redisPool == nil {
-			continue
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[dispatcher] sync loop stopped")
+			return
+		case <-ticker.C:
+			e.syncOnce(ctx)
 		}
-
-		ctx := context.Background()
-		nodes, err := e.redisPool.GetAllNodes(ctx)
-		if err != nil {
-			continue
-		}
-
-		e.mu.Lock()
-		for nodeID, state := range nodes {
-			load, ok := e.loads[nodeID]
-			if !ok {
-				load = &FlexibleLoad{
-					DeviceID:   nodeID,
-					DeviceType: inferDeviceType(nodeID),
-					Online:     true,
-				}
-				e.loads[nodeID] = load
-			}
-
-			load.CurrentLoadMW = state.ActivePower
-			load.SOC = state.SOC
-			load.MaxReductionMW = calculateReductionPotential(load)
-
-			if state.ActivePower == 0 && state.SOC == 0 {
-				load.Online = false
-			} else {
-				load.Online = true
-			}
-		}
-		e.mu.Unlock()
 	}
+}
+
+func (e *Engine) syncOnce(ctx context.Context) {
+	if e.redisPool == nil {
+		return
+	}
+
+	if !e.redisPool.IsHealthy() {
+		return
+	}
+
+	syncCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	nodes, err := e.redisPool.GetAllNodes(syncCtx)
+	if err != nil {
+		return
+	}
+
+	e.mu.Lock()
+	for nodeID, state := range nodes {
+		load, ok := e.loads[nodeID]
+		if !ok {
+			load = &FlexibleLoad{
+				DeviceID:   nodeID,
+				DeviceType: inferDeviceType(nodeID),
+				Online:     true,
+			}
+			e.loads[nodeID] = load
+		}
+
+		load.CurrentLoadMW = state.ActivePower
+		load.SOC = state.SOC
+		load.MaxReductionMW = calculateReductionPotential(load)
+
+		if state.ActivePower == 0 && state.SOC == 0 {
+			load.Online = false
+		} else {
+			load.Online = true
+		}
+	}
+	e.mu.Unlock()
 }
 
 func inferDeviceType(nodeID string) string {
