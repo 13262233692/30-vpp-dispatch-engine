@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package vpp.dispatch;
+
+option go_package = "github.com/vpp/dispatch-engine/api/proto";
+
+service DispatchService {
+  rpc LoadShedding(LoadSheddingRequest) returns (LoadSheddingResponse);
+  rpc GetFleetStatus(FleetStatusRequest) returns (FleetStatusResponse);
+  rpc EmergencyShutdown(EmergencyShutdownRequest) returns (EmergencyShutdownResponse);
+}
+
+message LoadSheddingRequest {
+  string request_id = 1;
+  double target_reduction_mw = 2;
+  int64 deadline_ms = 3;
+  SheddingStrategy strategy = 4;
+  repeated string excluded_device_ids = 5;
+  double max_cost_per_mw = 6;
+}
+
+enum SheddingStrategy {
+  STRATEGY_GREEDY = 0;
+  STRATEGY_COST_OPTIMAL = 1;
+  STRATEGY_SPEED_PRIORITY = 2;
+}
+
+message LoadSheddingResponse {
+  string request_id = 1;
+  bool success = 2;
+  double actual_reduction_mw = 3;
+  int32 device_count = 4;
+  repeated DeviceControlCommand commands = 5;
+  int64 compute_time_us = 6;
+  string message = 7;
+}
+
+message DeviceControlCommand {
+  string device_id = 1;
+  string device_type = 2;
+  double current_load_mw = 3;
+  double target_load_mw = 4;
+  double reduction_mw = 5;
+  double response_time_ms = 6;
+  double cost_per_mw = 7;
+  int32 priority = 8;
+  string control_action = 9;
+}
+
+message FleetStatusRequest {
+  repeated string device_ids = 1;
+}
+
+message FleetStatusResponse {
+  repeated DeviceStatus devices = 1;
+  double total_capacity_mw = 2;
+  double total_available_mw = 3;
+  int32 device_count = 4;
+}
+
+message DeviceStatus {
+  string device_id = 1;
+  string device_type = 2;
+  double current_load_mw = 3;
+  double max_reduction_mw = 4;
+  double response_time_ms = 5;
+  double cost_per_mw = 6;
+  double soc = 7;
+  bool online = 8;
+}
+
+message EmergencyShutdownRequest {
+  string request_id = 1;
+  repeated string device_ids = 2;
+  double target_reduction_mw = 3;
+}
+
+message EmergencyShutdownResponse {
+  string request_id = 1;
+  bool success = 2;
+  int32 device_count = 3;
+  double actual_reduction_mw = 4;
+  repeated DeviceControlCommand commands = 5;
+}
