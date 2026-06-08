@@ -13,6 +13,7 @@ type Config struct {
 	GRPC       GRPCConfig
 	Dispatcher DispatcherConfig
 	Lifecycle  LifecycleConfig
+	Market     MarketConfig
 }
 
 type IEC61850Config struct {
@@ -49,6 +50,22 @@ type LifecycleConfig struct {
 	ShutdownTimeout  time.Duration
 }
 
+type MarketConfig struct {
+	Enabled          bool
+	WeatherAPIURL    string
+	LMPAPIURL        string
+	WeatherAPIKey    string
+	LMPAPIKey        string
+	TradingCenterURL string
+	TradingAPIKey    string
+	TradingAPISecret string
+	VPPID            string
+	NodeID           string
+	ScheduleInterval time.Duration
+	NetworkLossRate  float64
+	TradingFeeRate   float64
+}
+
 func Load() *Config {
 	return &Config{
 		IEC61850: IEC61850Config{
@@ -79,6 +96,21 @@ func Load() *Config {
 		Lifecycle: LifecycleConfig{
 			HealthInterval:  envOrDefaultDuration("LIFECYCLE_HEALTH_INTERVAL", 30*time.Second),
 			ShutdownTimeout: envOrDefaultDuration("LIFECYCLE_SHUTDOWN_TIMEOUT", 15*time.Second),
+		},
+		Market: MarketConfig{
+			Enabled:          os.Getenv("MARKET_ENABLED") == "true",
+			WeatherAPIURL:    envOrDefault("MARKET_WEATHER_API_URL", ""),
+			LMPAPIURL:        envOrDefault("MARKET_LMP_API_URL", ""),
+			WeatherAPIKey:    envOrDefault("MARKET_WEATHER_API_KEY", ""),
+			LMPAPIKey:        envOrDefault("MARKET_LMP_API_KEY", ""),
+			TradingCenterURL: envOrDefault("MARKET_TRADING_URL", ""),
+			TradingAPIKey:    envOrDefault("MARKET_TRADING_API_KEY", ""),
+			TradingAPISecret: envOrDefault("MARKET_TRADING_API_SECRET", ""),
+			VPPID:            envOrDefault("MARKET_VPP_ID", "VPP-DEMO-001"),
+			NodeID:           envOrDefault("MARKET_NODE_ID", "NODE-EAST-01"),
+			ScheduleInterval: envOrDefaultDuration("MARKET_SCHEDULE_INTERVAL", 1*time.Hour),
+			NetworkLossRate:  envOrDefaultFloat("MARKET_NETWORK_LOSS_RATE", 0.03),
+			TradingFeeRate:   envOrDefaultFloat("MARKET_TRADING_FEE_RATE", 0.02),
 		},
 	}
 }
@@ -113,6 +145,15 @@ func envOrDefaultDuration(key string, defaultValue time.Duration) time.Duration 
 	if val := os.Getenv(key); val != "" {
 		if d, err := time.ParseDuration(val); err == nil {
 			return d
+		}
+	}
+	return defaultValue
+}
+
+func envOrDefaultFloat(key string, defaultValue float64) float64 {
+	if val := os.Getenv(key); val != "" {
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return f
 		}
 	}
 	return defaultValue

@@ -12,6 +12,7 @@ import (
 	grpcServer "github.com/vpp/dispatch-engine/internal/grpc"
 	"github.com/vpp/dispatch-engine/internal/ingestion"
 	"github.com/vpp/dispatch-engine/internal/lifecycle"
+	"github.com/vpp/dispatch-engine/internal/market"
 	"github.com/vpp/dispatch-engine/internal/mms"
 	"github.com/vpp/dispatch-engine/internal/redispool"
 	"github.com/vpp/dispatch-engine/pkg/config"
@@ -90,6 +91,33 @@ func main() {
 
 	eng.Start(rootCtx)
 
+	var biddingOp *market.BiddingOperator
+	if cfg.Market.Enabled {
+		vppEcon := buildDemoVPPEconomics()
+		biddingOp = market.NewBiddingOperator(market.BiddingOperatorConfig{
+			VPPEconomics: vppEcon,
+			FetcherConfig: market.DataFetcherConfig{
+				WeatherAPIURL: cfg.Market.WeatherAPIURL,
+				LMPAPIURL:     cfg.Market.LMPAPIURL,
+				WeatherAPIKey: cfg.Market.WeatherAPIKey,
+				LMPAPIKey:     cfg.Market.LMPAPIKey,
+				NodeID:        cfg.Market.NodeID,
+				HTTPTimeout:   10 * time.Second,
+				FetchInterval: 15 * time.Minute,
+			},
+			BidClientConfig: market.BidClientConfig{
+				TradingCenterURL: cfg.Market.TradingCenterURL,
+				APIKey:           cfg.Market.TradingAPIKey,
+				APISecret:        cfg.Market.TradingAPISecret,
+				VPPID:            cfg.Market.VPPID,
+				HTTPTimeout:      15 * time.Second,
+			},
+			GM:               gm,
+			ScheduleInterval: cfg.Market.ScheduleInterval,
+		})
+		biddingOp.Start(rootCtx)
+	}
+
 	log.Println("[main] VPP Dispatch Engine is running")
 	log.Printf("[main]   IEC 61850 TCP:  %s (maxConns=%d, idle=%v)", cfg.IEC61850.ListenAddr, cfg.IEC61850.MaxConns, cfg.IEC61850.IdleTimeout)
 	log.Printf("[main]   gRPC dispatch:  %s (maxConns=%d, maxRate=%d/s, timeout=%v)", cfg.GRPC.ListenAddr, cfg.GRPC.MaxConns, cfg.GRPC.MaxRate, cfg.GRPC.RequestTimeout)
@@ -121,6 +149,10 @@ func main() {
 	ingestionSrv.Stop()
 	eng.Stop()
 
+	if biddingOp != nil {
+		biddingOp.Stop()
+	}
+
 	if pool != nil {
 		pool.Close()
 	}
@@ -151,4 +183,39 @@ func seedDemoLoads(eng *dispatcher.Engine) {
 	}
 
 	log.Printf("[main] seeded %d demo flexible loads", len(demoLoads))
+}
+
+func buildDemoVPPEconomics() *market.VPPEconomics {
+	return &market.VPPEconomics{
+		Batteries: []market.BatteryEconomics{
+			{
+				DeviceID: "BAT-SITE-01", CapacityMWh: 20, CurrentSOC: 0.85, MinSOC: 0.1, MaxSOC: 0.95,
+				ChargeRateMW: 10, DischargeRateMW: 10, RampRateMWPerMin: 5,
+				RoundTripEfficiency: 0.92, CycleLife: 6000, ReplacementCost: 2000000,
+				DegradationCostPerCycle: 333, InitialInvestment: 2000000,
+			},
+			{
+				DeviceID: "BAT-SITE-02", CapacityMWh: 30, CurrentSOC: 0.72, MinSOC: 0.1, MaxSOC: 0.95,
+				ChargeRateMW: 15, DischargeRateMW: 15, RampRateMWPerMin: 4,
+				RoundTripEfficiency: 0.90, CycleLife: 5000, ReplacementCost: 3000000,
+				DegradationCostPerCycle: 600, InitialInvestment: 3000000,
+			},
+		},
+		FlexibleLoads: []market.FlexibleLoadEconomics{
+			{
+				DeviceID: "HVAC-BLDG-A-01", DeviceType: "hvac", MaxLoadMW: 15, MinLoadMW: 5,
+				RampRateMWPerMin: 2, CurtailmentCostPerMWh: 80,
+			},
+			{
+				DeviceID: "EV-STATION-01", DeviceType: "ev_charger", MaxLoadMW: 10, MinLoadMW: 0,
+				RampRateMWPerMin: 5, CurtailmentCostPerMWh: 120,
+			},
+			{
+				DeviceID: "IND-FACTORY-01", DeviceType: "industrial", MaxLoadMW: 25, MinLoadMW: 15,
+				RampRateMWPerMin: 1, CurtailmentCostPerMWh: 200,
+			},
+		},
+		NetworkLossRate: 0.03,
+		TradingFeeRate:  0.02,
+	}
 }
